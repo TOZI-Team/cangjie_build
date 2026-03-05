@@ -114,7 +114,7 @@ jobs:
             if [ -n "${{ inputs.tag }}" ]; then
               git clone --depth 1 --branch ${{ inputs.tag }} https://gitcode.com/Cangjie/${repo}.git
             else
-              git clone --depth 1 https://gitcode.com/Cangjie/${repo}.git
+              git clone --depth 1 https://github.com/cangjielanguage/${repo}.git
             fi
           }
           clone_repo cangjie_compiler
