@@ -23,7 +23,6 @@ on:
         default: true
 
 env:
-  # 基础版本号（可从输入 tag 派生，若无 tag 则用 "main"）
   CANGJIE_VERSION: ${{ inputs.tag || 'main' }}
   STDX_VERSION: 1
   BUILD_ROOT: ${{ github.workspace }}/buildtools
@@ -114,7 +113,7 @@ jobs:
             if [ -n "${{ inputs.tag }}" ]; then
               git clone --depth 1 --branch ${{ inputs.tag }} https://gitcode.com/Cangjie/${repo}.git
             else
-              git clone --depth 1 https://github.com/cangjielanguage/${repo}.git
+              git clone --depth 1 https://gitcode.com/Cangjie/${repo}.git
             fi
           }
           clone_repo cangjie_compiler
@@ -264,25 +263,27 @@ jobs:
           if [ -d "$STDX_DIR" ]; then
             cp -r $STDX_DIR ./
             chmod -R 750 linux_${ARCH}_cjnative
-            zip -qr cangjie-stdx-${SDK_NAME}-${CANGJIE_VERSION}.${STDX_VERSION}.zip linux_${ARCH}_cjnative
-            chmod 550 cangjie-stdx-${SDK_NAME}-${CANGJIE_VERSION}.${STDX_VERSION}.zip
-            echo "STDX_PACKAGE=cangjie-stdx-${SDK_NAME}-${CANGJIE_VERSION}.${STDX_VERSION}.zip" >> $GITHUB_ENV
+            # 改为 tar.gz 打包
+            tar -czf cangjie-stdx-${SDK_NAME}-${CANGJIE_VERSION}.${STDX_VERSION}.tar.gz linux_${ARCH}_cjnative
+            chmod 550 cangjie-stdx-${SDK_NAME}-${CANGJIE_VERSION}.${STDX_VERSION}.tar.gz
+            echo "STDX_PACKAGE=cangjie-stdx-${SDK_NAME}-${CANGJIE_VERSION}.${STDX_VERSION}.tar.gz" >> $GITHUB_ENV
           else
             echo "STDX directory not found, skipping STDX packaging."
           fi
 
-      # ---------- 上传构建产物 ----------
       - name: Upload SDK artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: cangjie-sdk-${{ env.SDK_NAME }}-${{ env.CANGJIE_VERSION }}
           path: ${{ github.workspace }}/cangjie-build/software/${{ env.SDK_PACKAGE }}
           if-no-files-found: error
+          archive: false
 
       - name: Upload STDX artifact (if exists)
         if: env.STDX_PACKAGE != ''
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: cangjie-stdx-${{ env.SDK_NAME }}-${{ env.CANGJIE_VERSION }}.${{ env.STDX_VERSION }}
           path: ${{ github.workspace }}/cangjie-build/software/${{ env.STDX_PACKAGE }}
           if-no-files-found: warn
+          archive: false
