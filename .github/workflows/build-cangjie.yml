@@ -1,0 +1,288 @@
+name: Build Cangjie SDK
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Tag to clone for all repositories (leave empty for default branch)'
+        required: false
+        default: ''
+      build_type:
+        description: 'Build type: release, debug, relwithdebinfo'
+        required: true
+        default: 'release'
+      run_tests:
+        description: 'Run tests for compiler after build'
+        type: boolean
+        required: true
+        default: false
+      static_libs:
+        description: 'Build static libedit and ncurses (recommended for portability)'
+        type: boolean
+        required: true
+        default: true
+
+env:
+  # 基础版本号（可从输入 tag 派生，若无 tag 则用 "main"）
+  CANGJIE_VERSION: ${{ inputs.tag || 'main' }}
+  STDX_VERSION: 1
+  BUILD_ROOT: ${{ github.workspace }}/buildtools
+  WORKSPACE: ${{ github.workspace }}/cangjie-build
+
+jobs:
+  build:
+    runs-on: ubuntu-22.04
+    steps:
+      - name: Checkout repository (for workflow itself, not needed for cangjie sources)
+        uses: actions/checkout@v4
+
+      - name: Set architecture and SDK name
+        run: |
+          ARCH=$(uname -m)
+          echo "ARCH=$ARCH" >> $GITHUB_ENV
+          if [ "$ARCH" = "x86_64" ]; then
+            echo "SDK_NAME=linux-x64" >> $GITHUB_ENV
+            echo "OPENSSL_PATH=/usr/lib/x86_64-linux-gnu" >> $GITHUB_ENV
+          elif [ "$ARCH" = "aarch64" ]; then
+            echo "SDK_NAME=linux-aarch64" >> $GITHUB_ENV
+            echo "OPENSSL_PATH=/usr/lib/aarch64-linux-gnu" >> $GITHUB_ENV
+          else
+            echo "Unsupported architecture: $ARCH"
+            exit 1
+          fi
+
+      - name: Install system tools
+        run: |
+          sudo apt update
+          sudo apt install -y \
+            tar unzip wget curl libcurl4 expat openssl make gcc g++ gettext \
+            nfs-common libtool sqlite3 zlib1g-dev libssl-dev cmake ninja-build \
+            libcurl4-openssl-dev sudo autoconf build-essential rapidjson-dev \
+            texinfo binutils expat libelf-dev libdwarf-dev openssh-client ssh \
+            dos2unix libxext-dev libxtst-dev libxt-dev libcups2-dev clang clang-15 \
+            libxrender-dev zip bzip2 libopenmpi-dev vim gdb lldb libclang-15-dev libgtest-dev \
+            rpm patch libtinfo5 cpio rpm2cpio libncurses5 libncurses5-dev strace net-tools
+
+      - name: Create build directories
+        run: |
+          sudo mkdir -p $BUILD_ROOT
+          sudo chown $USER:$USER $BUILD_ROOT
+          mkdir -p $WORKSPACE
+
+      # 可选：静态编译 ncurses 和 libedit
+      - name: Build static ncurses and libedit (if enabled)
+        if: ${{ inputs.static_libs == true }}
+        run: |
+          set -e
+          cd $BUILD_ROOT
+          CPUS=$(nproc)
+
+          # ncurses 6.5
+          wget -q https://ftp.gnu.org/pub/gnu/ncurses/ncurses-6.5.tar.gz
+          tar xzf ncurses-6.5.tar.gz
+          cd ncurses-6.5
+          ./configure --with-termlib CC=clang CXX=clang++ \
+            CFLAGS="-fPIC -fstack-protector-strong -Wl,-z,relro,-z,now,-z,noexecstack" \
+            CXXFLAGS="-fstack-protector-strong -Wl,-z,relro,-z,now,-z,noexecstack" \
+            --with-terminfo-dirs=/etc/terminfo:/lib/terminfo:/usr/share/terminfo \
+            --disable-widec --disable-overwrite --disable-root-environ
+          make -j $CPUS
+          make install DESTDIR=${BUILD_ROOT}/ncurses-6.5
+
+          # libedit 20210910-3.1
+          cd $BUILD_ROOT
+          wget -q https://thrysoee.dk/editline/libedit-20210910-3.1.tar.gz
+          tar xzf libedit-20210910-3.1.tar.gz
+          cd libedit-20210910-3.1
+          ./configure --with-pic --enable-shared=no --prefix=${BUILD_ROOT}/libedit-3.1
+          make -j $CPUS
+          make install
+
+      - name: Set environment variables for static libs (if built)
+        run: |
+          if [ "${{ inputs.static_libs }}" == "true" ]; then
+            echo "CMAKE_PREFIX_PATH=$BUILD_ROOT/libedit-3.1:$BUILD_ROOT/ncurses-6.5/usr" >> $GITHUB_ENV
+            echo "TARGET_LIB=$BUILD_ROOT/ncurses-6.5/usr/lib" >> $GITHUB_ENV
+          fi
+
+      - name: Clone Cangjie repositories
+        run: |
+          cd $WORKSPACE
+          # Helper function: clone with optional tag
+          clone_repo() {
+            repo=$1
+            if [ -n "${{ inputs.tag }}" ]; then
+              git clone --depth 1 --branch ${{ inputs.tag }} https://gitcode.com/Cangjie/${repo}.git
+            else
+              git clone --depth 1 https://gitcode.com/Cangjie/${repo}.git
+            fi
+          }
+          clone_repo cangjie_compiler
+          clone_repo cangjie_runtime
+          clone_repo cangjie_tools
+          clone_repo cangjie_stdx
+
+      # ---------- 编译器 ----------
+      - name: Build compiler
+        id: build_compiler
+        run: |
+          cd $WORKSPACE/cangjie_compiler
+          # 如果静态库编译了，传入 --target-lib
+          TARGET_LIB_OPT=""
+          if [ -n "$TARGET_LIB" ]; then
+            TARGET_LIB_OPT="--target-lib=$TARGET_LIB"
+          fi
+          python3 build.py clean
+          python3 build.py build -t ${{ inputs.build_type }} \
+            --no-tests \
+            $TARGET_LIB_OPT \
+            --build-cjdb
+          python3 build.py install
+          echo "status=success" >> $GITHUB_OUTPUT
+
+      - name: Run compiler tests (if enabled)
+        if: ${{ inputs.run_tests == true && steps.build_compiler.outputs.status == 'success' }}
+        run: |
+          cd $WORKSPACE/cangjie_compiler
+          source output/envsetup.sh
+          python3 build.py test
+
+      # ---------- 运行时 ---------- (允许失败)
+      - name: Build runtime
+        id: build_runtime
+        continue-on-error: true
+        run: |
+          cd $WORKSPACE/cangjie_runtime/runtime
+          source $WORKSPACE/cangjie_compiler/output/envsetup.sh
+          python3 build.py clean
+          python3 build.py build -t ${{ inputs.build_type }} -v $CANGJIE_VERSION
+          python3 build.py install
+          cp -R output/common/linux_release_${ARCH}/{lib,runtime} $WORKSPACE/cangjie_compiler/output/
+          echo "status=success" >> $GITHUB_OUTPUT
+
+      # ---------- 标准库 ---------- (允许失败)
+      - name: Build standard library
+        id: build_stdlib
+        continue-on-error: true
+        run: |
+          cd $WORKSPACE/cangjie_runtime/stdlib
+          source $WORKSPACE/cangjie_compiler/output/envsetup.sh
+          python3 build.py clean
+          python3 build.py build -t ${{ inputs.build_type }} \
+            --target-lib=$WORKSPACE/cangjie_runtime/runtime/output
+          python3 build.py install
+          cp -R $WORKSPACE/cangjie_runtime/stdlib/output/* $WORKSPACE/cangjie_compiler/output/
+          echo "status=success" >> $GITHUB_OUTPUT
+
+      # ---------- STDX扩展库 ---------- (允许失败)
+      - name: Build STDX
+        id: build_stdx
+        continue-on-error: true
+        run: |
+          cd $WORKSPACE/cangjie_stdx
+          source $WORKSPACE/cangjie_compiler/output/envsetup.sh
+          python3 build.py clean
+          python3 build.py build -t ${{ inputs.build_type }} \
+            --include=$WORKSPACE/cangjie_compiler/include
+          python3 build.py install
+          echo "CANGJIE_STDX_PATH=$WORKSPACE/cangjie_stdx/target/linux_${ARCH}_cjnative/static/stdx" >> $GITHUB_ENV
+          echo "status=success" >> $GITHUB_OUTPUT
+
+      # ---------- 工具集 (cjpm, cjfmt, hle, lsp) ---------- (允许失败)
+      - name: Build cjpm
+        id: build_cjpm
+        continue-on-error: true
+        run: |
+          cd $WORKSPACE/cangjie_tools/cjpm/build
+          source $WORKSPACE/cangjie_compiler/output/envsetup.sh
+          python3 build.py clean
+          python3 build.py build -t ${{ inputs.build_type }} \
+            --set-rpath \$ORIGIN/../../runtime/lib/linux_${ARCH}_cjnative
+          python3 build.py install
+          echo "status=success" >> $GITHUB_OUTPUT
+
+      - name: Build cjfmt
+        id: build_cjfmt
+        continue-on-error: true
+        run: |
+          cd $WORKSPACE/cangjie_tools/cjfmt/build
+          source $WORKSPACE/cangjie_compiler/output/envsetup.sh
+          python3 build.py clean
+          python3 build.py build -t ${{ inputs.build_type }}
+          python3 build.py install
+          echo "status=success" >> $GITHUB_OUTPUT
+
+      - name: Build HyperLangExtension (hle)
+        id: build_hle
+        continue-on-error: true
+        run: |
+          cd $WORKSPACE/cangjie_tools/hyperlangExtension/build
+          source $WORKSPACE/cangjie_compiler/output/envsetup.sh
+          python3 build.py clean
+          python3 build.py build -t ${{ inputs.build_type }}
+          python3 build.py install
+          echo "status=success" >> $GITHUB_OUTPUT
+
+      - name: Build LSP Server
+        id: build_lsp
+        continue-on-error: true
+        run: |
+          cd $WORKSPACE/cangjie_tools/cangjie-language-server/build
+          source $WORKSPACE/cangjie_compiler/output/envsetup.sh
+          python3 build.py clean
+          python3 build.py build -t ${{ inputs.build_type }}
+          python3 build.py install
+          echo "status=success" >> $GITHUB_OUTPUT
+
+      # ---------- 打包 SDK 和 STDX ----------
+      - name: Package SDK
+        run: |
+          mkdir -p $WORKSPACE/software
+          cd $WORKSPACE/software
+          # 拷贝 compiler 输出（必须存在）
+          cp -R $WORKSPACE/cangjie_compiler/output cangjie
+          rm -rf cangjie/lib/linux_${ARCH}_cjnative/libcangjie-ast-support.a || true
+
+          # 组织 tools（如果相应文件存在则拷贝，否则忽略）
+          mkdir -p cangjie/tools/bin cangjie/tools/config
+          [ -f $WORKSPACE/cangjie_tools/cjpm/dist/cjpm ] && cp $WORKSPACE/cangjie_tools/cjpm/dist/cjpm cangjie/tools/bin/cjpm || true
+          [ -f $WORKSPACE/cangjie_tools/cjfmt/build/build/bin/cjfmt ] && cp $WORKSPACE/cangjie_tools/cjfmt/build/build/bin/cjfmt cangjie/tools/bin/cjfmt || true
+          [ -d $WORKSPACE/cangjie_tools/cjfmt/config ] && cp $WORKSPACE/cangjie_tools/cjfmt/config/*.toml cangjie/tools/config/ || true
+          [ -f $WORKSPACE/cangjie_tools/hyperlangExtension/target/bin/main ] && cp $WORKSPACE/cangjie_tools/hyperlangExtension/target/bin/main cangjie/tools/bin/hle || true
+          [ -d $WORKSPACE/cangjie_tools/hyperlangExtension/src/dtsparser ] && cp -r $WORKSPACE/cangjie_tools/hyperlangExtension/src/dtsparser cangjie/tools/ || true
+          [ -f $WORKSPACE/cangjie_tools/cangjie-language-server/output/bin/LSPServer ] && cp $WORKSPACE/cangjie_tools/cangjie-language-server/output/bin/LSPServer cangjie/tools/bin/ || true
+
+          chmod -R 750 cangjie
+          tar --format=gnu -zcvf cangjie-sdk-${SDK_NAME}-${CANGJIE_VERSION}.tar.gz cangjie
+          chmod 550 cangjie-sdk-${SDK_NAME}-${CANGJIE_VERSION}.tar.gz
+          echo "SDK_PACKAGE=cangjie-sdk-${SDK_NAME}-${CANGJIE_VERSION}.tar.gz" >> $GITHUB_ENV
+
+      - name: Package STDX (if built)
+        run: |
+          cd $WORKSPACE/software
+          STDX_DIR=$WORKSPACE/cangjie_stdx/target/linux_${ARCH}_cjnative
+          if [ -d "$STDX_DIR" ]; then
+            cp -r $STDX_DIR ./
+            chmod -R 750 linux_${ARCH}_cjnative
+            zip -qr cangjie-stdx-${SDK_NAME}-${CANGJIE_VERSION}.${STDX_VERSION}.zip linux_${ARCH}_cjnative
+            chmod 550 cangjie-stdx-${SDK_NAME}-${CANGJIE_VERSION}.${STDX_VERSION}.zip
+            echo "STDX_PACKAGE=cangjie-stdx-${SDK_NAME}-${CANGJIE_VERSION}.${STDX_VERSION}.zip" >> $GITHUB_ENV
+          else
+            echo "STDX directory not found, skipping STDX packaging."
+          fi
+
+      # ---------- 上传构建产物 ----------
+      - name: Upload SDK artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: cangjie-sdk-${{ env.SDK_NAME }}-${{ env.CANGJIE_VERSION }}
+          path: ${{ github.workspace }}/cangjie-build/software/${{ env.SDK_PACKAGE }}
+          if-no-files-found: error
+
+      - name: Upload STDX artifact (if exists)
+        if: env.STDX_PACKAGE != ''
+        uses: actions/upload-artifact@v4
+        with:
+          name: cangjie-stdx-${{ env.SDK_NAME }}-${{ env.CANGJIE_VERSION }}.${{ env.STDX_VERSION }}
+          path: ${{ github.workspace }}/cangjie-build/software/${{ env.STDX_PACKAGE }}
+          if-no-files-found: warn
