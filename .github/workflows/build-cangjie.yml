@@ -21,18 +21,25 @@ on:
         type: boolean
         required: true
         default: true
+      disable_cache:
+        description: 'Disable sccache (do not use any previous cache)'
+        type: boolean
+        required: true
+        default: false
 
 env:
   CANGJIE_VERSION: ${{ inputs.tag || 'main' }}
   STDX_VERSION: 1
   BUILD_ROOT: ${{ github.workspace }}/buildtools
   WORKSPACE: ${{ github.workspace }}/cangjie-build
+  # sccache 缓存目录
+  SCCACHE_DIR: ${{ github.workspace }}/.sccache-cache
 
 jobs:
   build:
     runs-on: ubuntu-22.04
     steps:
-      - name: Checkout repository (for workflow itself, not needed for cangjie sources)
+      - name: Checkout repository
         uses: actions/checkout@v4
 
       - name: Set architecture and SDK name
@@ -62,6 +69,59 @@ jobs:
             libxrender-dev zip bzip2 libopenmpi-dev vim gdb lldb libclang-15-dev libgtest-dev \
             rpm patch libtinfo5 cpio rpm2cpio libncurses5 libncurses5-dev strace net-tools
 
+      # ---------- sccache 安装与配置 ----------
+      - name: Install sccache
+        run: |
+          # 下载最新的 sccache 并安装到 /usr/local/bin
+          SCCACHE_VERSION="0.8.2"
+          ARCH=$(uname -m)
+          if [ "$ARCH" = "x86_64" ]; then
+            SCCACHE_ARCH="x86_64-unknown-linux-musl"
+          elif [ "$ARCH" = "aarch64" ]; then
+            SCCACHE_ARCH="aarch64-unknown-linux-musl"
+          else
+            echo "Unsupported architecture for sccache: $ARCH"
+            exit 1
+          fi
+          wget -q "https://github.com/mozilla/sccache/releases/download/v${SCCACHE_VERSION}/sccache-v${SCCACHE_VERSION}-${SCCACHE_ARCH}.tar.gz"
+          tar -xzf "sccache-v${SCCACHE_VERSION}-${SCCACHE_ARCH}.tar.gz"
+          sudo mv "sccache-v${SCCACHE_VERSION}-${SCCACHE_ARCH}/sccache" /usr/local/bin/
+          chmod +x /usr/local/bin/sccache
+          rm -rf "sccache-v${SCCACHE_VERSION}-${SCCACHE_ARCH}"*
+
+      - name: Setup sccache wrappers
+        run: |
+          # 创建包装器目录，并添加到 PATH
+          mkdir -p $HOME/sccache-wrapper
+          cat > $HOME/sccache-wrapper/clang << 'EOF'
+          #!/bin/bash
+          exec sccache /usr/bin/clang-15 "$@"
+          EOF
+          cat > $HOME/sccache-wrapper/clang++ << 'EOF'
+          #!/bin/bash
+          exec sccache /usr/bin/clang++-15 "$@"
+          EOF
+          chmod +x $HOME/sccache-wrapper/clang $HOME/sccache-wrapper/clang++
+          echo "$HOME/sccache-wrapper" >> $GITHUB_PATH
+          # 设置 sccache 缓存目录
+          echo "SCCACHE_DIR=$SCCACHE_DIR" >> $GITHUB_ENV
+
+      - name: Restore sccache cache (if not disabled)
+        if: ${{ !inputs.disable_cache }}
+        uses: actions/cache@v4
+        with:
+          path: ${{ env.SCCACHE_DIR }}
+          key: sccache-${{ runner.os }}-${{ env.ARCH }}-${{ github.sha }}
+          restore-keys: |
+            sccache-${{ runner.os }}-${{ env.ARCH }}-
+
+      # 可选：如果禁用缓存，清理可能存在的旧缓存
+      - name: Clear sccache cache (if disabled)
+        if: ${{ inputs.disable_cache }}
+        run: |
+          rm -rf $SCCACHE_DIR || true
+
+      # ---------- 其余构建步骤保持不变 ----------
       - name: Create build directories
         run: |
           sudo mkdir -p $BUILD_ROOT
@@ -76,7 +136,6 @@ jobs:
           cd $BUILD_ROOT
           CPUS=$(nproc)
 
-          # ncurses 6.5
           wget -q https://ftp.gnu.org/pub/gnu/ncurses/ncurses-6.5.tar.gz
           tar xzf ncurses-6.5.tar.gz
           cd ncurses-6.5
@@ -88,7 +147,6 @@ jobs:
           make -j $CPUS
           make install DESTDIR=${BUILD_ROOT}/ncurses-6.5
 
-          # libedit 20210910-3.1
           cd $BUILD_ROOT
           wget -q https://thrysoee.dk/editline/libedit-20210910-3.1.tar.gz
           tar xzf libedit-20210910-3.1.tar.gz
@@ -107,7 +165,6 @@ jobs:
       - name: Clone Cangjie repositories
         run: |
           cd $WORKSPACE
-          # Helper function: clone with optional tag
           clone_repo() {
             repo=$1
             if [ -n "${{ inputs.tag }}" ]; then
@@ -126,7 +183,6 @@ jobs:
         id: build_compiler
         run: |
           cd $WORKSPACE/cangjie_compiler
-          # 如果静态库编译了，传入 --target-lib
           TARGET_LIB_OPT=""
           if [ -n "$TARGET_LIB" ]; then
             TARGET_LIB_OPT="--target-lib=$TARGET_LIB"
@@ -187,7 +243,7 @@ jobs:
           echo "CANGJIE_STDX_PATH=$WORKSPACE/cangjie_stdx/target/linux_${ARCH}_cjnative/static/stdx" >> $GITHUB_ENV
           echo "status=success" >> $GITHUB_OUTPUT
 
-      # ---------- 工具集 (cjpm, cjfmt, hle, lsp) ---------- (允许失败)
+      # ---------- 工具集 ---------- (允许失败)
       - name: Build cjpm
         id: build_cjpm
         continue-on-error: true
@@ -233,16 +289,19 @@ jobs:
           python3 build.py install
           echo "status=success" >> $GITHUB_OUTPUT
 
-      # ---------- 打包 SDK 和 STDX ----------
-      - name: Package SDK
+      # ---------- 打包 SDK（包含 debug 符号分离） ----------
+      - name: Package SDK (with debug symbol separation)
+        id: package_sdk
         run: |
+          set -e
           mkdir -p $WORKSPACE/software
           cd $WORKSPACE/software
-          # 拷贝 compiler 输出（必须存在）
+
+          # 1. 拷贝 compiler 输出（必须存在）
           cp -R $WORKSPACE/cangjie_compiler/output cangjie
           rm -rf cangjie/lib/linux_${ARCH}_cjnative/libcangjie-ast-support.a || true
 
-          # 组织 tools（如果相应文件存在则拷贝，否则忽略）
+          # 2. 组织 tools（如果相应文件存在则拷贝，否则忽略）
           mkdir -p cangjie/tools/bin cangjie/tools/config
           [ -f $WORKSPACE/cangjie_tools/cjpm/dist/cjpm ] && cp $WORKSPACE/cangjie_tools/cjpm/dist/cjpm cangjie/tools/bin/cjpm || true
           [ -f $WORKSPACE/cangjie_tools/cjfmt/build/build/bin/cjfmt ] && cp $WORKSPACE/cangjie_tools/cjfmt/build/build/bin/cjfmt cangjie/tools/bin/cjfmt || true
@@ -251,11 +310,40 @@ jobs:
           [ -d $WORKSPACE/cangjie_tools/hyperlangExtension/src/dtsparser ] && cp -r $WORKSPACE/cangjie_tools/hyperlangExtension/src/dtsparser cangjie/tools/ || true
           [ -f $WORKSPACE/cangjie_tools/cangjie-language-server/output/bin/LSPServer ] && cp $WORKSPACE/cangjie_tools/cangjie-language-server/output/bin/LSPServer cangjie/tools/bin/ || true
 
-          chmod -R 750 cangjie
-          tar --format=gnu -zcvf cangjie-sdk-${SDK_NAME}-${CANGJIE_VERSION}.tar.gz cangjie
-          chmod 550 cangjie-sdk-${SDK_NAME}-${CANGJIE_VERSION}.tar.gz
-          echo "SDK_PACKAGE=cangjie-sdk-${SDK_NAME}-${CANGJIE_VERSION}.tar.gz" >> $GITHUB_ENV
+          # 3. 剥离调试符号（仅针对可执行文件和动态库）
+          DEBUG_DIR="$WORKSPACE/software/debug-symbols"
+          mkdir -p "$DEBUG_DIR"
 
+          find cangjie -type f \( -perm -111 -o -name "*.so" \) | while read -r file; do
+            if file "$file" | grep -q "ELF"; then
+              echo "Processing $file"
+              rel_path="${file#cangjie/}"
+              debug_file="$DEBUG_DIR/cangjie/${rel_path}.debug"
+              mkdir -p "$(dirname "$debug_file")"
+              objcopy --only-keep-debug "$file" "$debug_file"
+              objcopy --strip-debug "$file"
+              objcopy --add-gnu-debuglink="$debug_file" "$file"
+            fi
+          done
+
+          # 4. 打包 SDK（此时 cangjie 目录已不含调试符号）
+          chmod -R 750 cangjie
+          SDK_PKG="cangjie-sdk-${SDK_NAME}-${CANGJIE_VERSION}.tar.gz"
+          tar --format=gnu -czf "$SDK_PKG" cangjie
+          chmod 550 "$SDK_PKG"
+          echo "SDK_PACKAGE=$SDK_PKG" >> $GITHUB_ENV
+
+          # 5. 如果有调试符号文件，打包 debug 包
+          if [ -d "$DEBUG_DIR" ] && [ "$(ls -A "$DEBUG_DIR")" ]; then
+            DEBUG_PKG="cangjie-sdk-debug-${SDK_NAME}-${CANGJIE_VERSION}.tar.gz"
+            tar -czf "$DEBUG_PKG" -C "$WORKSPACE/software" debug-symbols
+            chmod 550 "$DEBUG_PKG"
+            echo "DEBUG_PACKAGE=$DEBUG_PKG" >> $GITHUB_ENV
+          else
+            echo "No debug symbols found."
+          fi
+
+      # ---------- 打包 STDX ----------
       - name: Package STDX (if built)
         run: |
           cd $WORKSPACE/software
@@ -263,20 +351,30 @@ jobs:
           if [ -d "$STDX_DIR" ]; then
             cp -r $STDX_DIR ./
             chmod -R 750 linux_${ARCH}_cjnative
-            # 改为 tar.gz 打包
-            tar -czf cangjie-stdx-${SDK_NAME}-${CANGJIE_VERSION}.${STDX_VERSION}.tar.gz linux_${ARCH}_cjnative
-            chmod 550 cangjie-stdx-${SDK_NAME}-${CANGJIE_VERSION}.${STDX_VERSION}.tar.gz
-            echo "STDX_PACKAGE=cangjie-stdx-${SDK_NAME}-${CANGJIE_VERSION}.${STDX_VERSION}.tar.gz" >> $GITHUB_ENV
+            STDX_PKG="cangjie-stdx-${SDK_NAME}-${CANGJIE_VERSION}.${STDX_VERSION}.tar.gz"
+            tar -czf "$STDX_PKG" linux_${ARCH}_cjnative
+            chmod 550 "$STDX_PKG"
+            echo "STDX_PACKAGE=$STDX_PKG" >> $GITHUB_ENV
           else
             echo "STDX directory not found, skipping STDX packaging."
           fi
 
+      # ---------- 上传构建产物 ----------
       - name: Upload SDK artifact
         uses: actions/upload-artifact@v7
         with:
           name: cangjie-sdk-${{ env.SDK_NAME }}-${{ env.CANGJIE_VERSION }}
           path: ${{ github.workspace }}/cangjie-build/software/${{ env.SDK_PACKAGE }}
           if-no-files-found: error
+          archive: false
+
+      - name: Upload debug symbols artifact (if exists)
+        if: env.DEBUG_PACKAGE != ''
+        uses: actions/upload-artifact@v7
+        with:
+          name: cangjie-sdk-debug-${{ env.SDK_NAME }}-${{ env.CANGJIE_VERSION }}
+          path: ${{ github.workspace }}/cangjie-build/software/${{ env.DEBUG_PACKAGE }}
+          if-no-files-found: warn
           archive: false
 
       - name: Upload STDX artifact (if exists)
@@ -287,3 +385,11 @@ jobs:
           path: ${{ github.workspace }}/cangjie-build/software/${{ env.STDX_PACKAGE }}
           if-no-files-found: warn
           archive: false
+
+      # ---------- 保存 sccache 缓存（如果未禁用） ----------
+      - name: Save sccache cache (if not disabled)
+        if: ${{ !inputs.disable_cache }}
+        uses: actions/cache@v4
+        with:
+          path: ${{ env.SCCACHE_DIR }}
+          key: sccache-${{ runner.os }}-${{ env.ARCH }}-${{ github.sha }}
