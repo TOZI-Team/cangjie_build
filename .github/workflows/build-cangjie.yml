@@ -212,7 +212,32 @@ jobs:
           python3 build.py clean
           python3 build.py build -t ${{ inputs.build_type }} -v $CANGJIE_VERSION
           python3 build.py install
-          cp -R output/common/linux_release_${ARCH}/{lib,runtime} $WORKSPACE/cangjie_compiler/output/
+          
+          # 修复：根据 build_type 动态构建目录名
+          BUILD_TYPE_LOWER=$(echo "${{ inputs.build_type }}" | tr '[:upper:]' '[:lower:]')
+          OUTPUT_DIR="output/common/linux_${BUILD_TYPE_LOWER}_${ARCH}"
+          
+          # 检查目录是否存在
+          if [ -d "$OUTPUT_DIR" ]; then
+            echo "Copying runtime files from $OUTPUT_DIR"
+            cp -R "${OUTPUT_DIR}/"{lib,runtime} $WORKSPACE/cangjie_compiler/output/
+          else
+            # 如果特定构建类型的目录不存在，尝试其他可能的目录名称
+            echo "Warning: Directory $OUTPUT_DIR not found, trying alternative names..."
+            # 尝试 Release 目录（某些构建系统可能使用固定名称）
+            ALT_DIR="output/common/linux_release_${ARCH}"
+            if [ -d "$ALT_DIR" ]; then
+              echo "Found alternative directory: $ALT_DIR"
+              cp -R "${ALT_DIR}/"{lib,runtime} $WORKSPACE/cangjie_compiler/output/
+            else
+              echo "Error: Neither $OUTPUT_DIR nor $ALT_DIR found"
+              # 列出可用的目录
+              echo "Available directories in output/common/:"
+              ls -la output/common/ || true
+              exit 1
+            fi
+          fi
+          
           echo "status=success" >> $GITHUB_OUTPUT
 
       # ---------- 标准库 ---------- (允许失败)
