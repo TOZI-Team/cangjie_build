@@ -40,7 +40,7 @@ jobs:
     runs-on: ubuntu-22.04
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
 
       - name: Set architecture and SDK name
         run: |
@@ -106,9 +106,9 @@ jobs:
           # 设置 sccache 缓存目录
           echo "SCCACHE_DIR=$SCCACHE_DIR" >> $GITHUB_ENV
 
-      - name: Restore sccache cache (if not disabled)
+      - name: Restore sccache cache
         if: ${{ !inputs.disable_cache }}
-        uses: actions/cache@v4
+        uses: actions/cache@v5
         with:
           path: ${{ env.SCCACHE_DIR }}
           key: sccache-${{ runner.os }}-${{ env.ARCH }}-${{ github.sha }}
@@ -116,7 +116,7 @@ jobs:
             sccache-${{ runner.os }}-${{ env.ARCH }}-
 
       # 可选：如果禁用缓存，清理可能存在的旧缓存
-      - name: Clear sccache cache (if disabled)
+      - name: Clear sccache cache
         if: ${{ inputs.disable_cache }}
         run: |
           rm -rf $SCCACHE_DIR || true
@@ -129,7 +129,7 @@ jobs:
           mkdir -p $WORKSPACE
 
       # 可选：静态编译 ncurses 和 libedit
-      - name: Build static ncurses and libedit (if enabled)
+      - name: Build static ncurses and libedit
         if: ${{ inputs.static_libs == true }}
         run: |
           set -e
@@ -155,7 +155,7 @@ jobs:
           make -j $CPUS
           make install
 
-      - name: Set environment variables for static libs (if built)
+      - name: Set environment variables for static libs
         run: |
           if [ "${{ inputs.static_libs }}" == "true" ]; then
             echo "CMAKE_PREFIX_PATH=$BUILD_ROOT/libedit-3.1:$BUILD_ROOT/ncurses-6.5/usr" >> $GITHUB_ENV
@@ -195,7 +195,7 @@ jobs:
           python3 build.py install
           echo "status=success" >> $GITHUB_OUTPUT
 
-      - name: Run compiler tests (if enabled)
+      - name: Run compiler tests
         if: ${{ inputs.run_tests == true && steps.build_compiler.outputs.status == 'success' }}
         run: |
           cd $WORKSPACE/cangjie_compiler
@@ -315,7 +315,7 @@ jobs:
           echo "status=success" >> $GITHUB_OUTPUT
 
       # ---------- 打包 SDK（包含 debug 符号分离） ----------
-      - name: Package SDK (with debug symbol separation)
+      - name: Package SDK
         id: package_sdk
         run: |
           set -e
@@ -369,7 +369,7 @@ jobs:
           fi
 
       # ---------- 打包 STDX ----------
-      - name: Package STDX (if built)
+      - name: Package STDX
         run: |
           cd $WORKSPACE/software
           STDX_DIR=$WORKSPACE/cangjie_stdx/target/linux_${ARCH}_cjnative
@@ -393,7 +393,7 @@ jobs:
           if-no-files-found: error
           archive: false
 
-      - name: Upload debug symbols artifact (if exists)
+      - name: Upload debug symbols artifact
         if: env.DEBUG_PACKAGE != ''
         uses: actions/upload-artifact@v7
         with:
@@ -402,7 +402,7 @@ jobs:
           if-no-files-found: warn
           archive: false
 
-      - name: Upload STDX artifact (if exists)
+      - name: Upload STDX artifact
         if: env.STDX_PACKAGE != ''
         uses: actions/upload-artifact@v7
         with:
@@ -412,9 +412,9 @@ jobs:
           archive: false
 
       # ---------- 保存 sccache 缓存（如果未禁用） ----------
-      - name: Save sccache cache (if not disabled)
+      - name: Save sccache cache
         if: ${{ !inputs.disable_cache }}
-        uses: actions/cache@v4
+        uses: actions/cache@v5
         with:
           path: ${{ env.SCCACHE_DIR }}
           key: sccache-${{ runner.os }}-${{ env.ARCH }}-${{ github.sha }}
