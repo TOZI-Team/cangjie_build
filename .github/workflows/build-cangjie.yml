@@ -26,6 +26,39 @@ on:
         type: boolean
         required: true
         default: false
+      # 新增：自定义仓库 URL 和 Tag
+      compiler_repo:
+        description: 'Compiler repository URL (default: https://gitcode.com/Cangjie/cangjie_compiler.git)'
+        required: false
+        default: 'https://gitcode.com/Cangjie/cangjie_compiler.git'
+      compiler_tag:
+        description: 'Tag for compiler repository (overrides global tag)'
+        required: false
+        default: ''
+      runtime_repo:
+        description: 'Runtime repository URL (default: https://gitcode.com/Cangjie/cangjie_runtime.git)'
+        required: false
+        default: 'https://gitcode.com/Cangjie/cangjie_runtime.git'
+      runtime_tag:
+        description: 'Tag for runtime repository (overrides global tag)'
+        required: false
+        default: ''
+      tools_repo:
+        description: 'Tools repository URL (default: https://gitcode.com/Cangjie/cangjie_tools.git)'
+        required: false
+        default: 'https://gitcode.com/Cangjie/cangjie_tools.git'
+      tools_tag:
+        description: 'Tag for tools repository (overrides global tag)'
+        required: false
+        default: ''
+      stdx_repo:
+        description: 'STDX repository URL (default: https://gitcode.com/Cangjie/cangjie_stdx.git)'
+        required: false
+        default: 'https://gitcode.com/Cangjie/cangjie_stdx.git'
+      stdx_tag:
+        description: 'Tag for stdx repository (overrides global tag)'
+        required: false
+        default: ''
 
 env:
   CANGJIE_VERSION: ${{ inputs.tag || 'main' }}
@@ -165,18 +198,33 @@ jobs:
       - name: Clone Cangjie repositories
         run: |
           cd $WORKSPACE
-          clone_repo() {
+          clone_with_tag() {
             repo=$1
-            if [ -n "${{ inputs.tag }}" ]; then
-              git clone --depth 1 --branch ${{ inputs.tag }} https://gitcode.com/Cangjie/${repo}.git
+            tag=$2
+            dir=$3
+            if [ -n "$tag" ]; then
+              git clone --depth 1 --branch "$tag" "$repo" "$dir"
             else
-              git clone --depth 1 https://gitcode.com/Cangjie/${repo}.git
+              git clone --depth 1 "$repo" "$dir"
             fi
           }
-          clone_repo cangjie_compiler
-          clone_repo cangjie_runtime
-          clone_repo cangjie_tools
-          clone_repo cangjie_stdx
+
+          # 为每个仓库确定最终的 repo 和 tag
+          COMPILER_REPO="${{ inputs.compiler_repo }}"
+          COMPILER_TAG="${{ inputs.compiler_tag || inputs.tag }}"
+          clone_with_tag "$COMPILER_REPO" "$COMPILER_TAG" "cangjie_compiler"
+
+          RUNTIME_REPO="${{ inputs.runtime_repo }}"
+          RUNTIME_TAG="${{ inputs.runtime_tag || inputs.tag }}"
+          clone_with_tag "$RUNTIME_REPO" "$RUNTIME_TAG" "cangjie_runtime"
+
+          TOOLS_REPO="${{ inputs.tools_repo }}"
+          TOOLS_TAG="${{ inputs.tools_tag || inputs.tag }}"
+          clone_with_tag "$TOOLS_REPO" "$TOOLS_TAG" "cangjie_tools"
+
+          STDX_REPO="${{ inputs.stdx_repo }}"
+          STDX_TAG="${{ inputs.stdx_tag || inputs.tag }}"
+          clone_with_tag "$STDX_REPO" "$STDX_TAG" "cangjie_stdx"
 
       # ---------- 编译器 ----------
       - name: Build compiler
